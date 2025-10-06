@@ -1,9 +1,9 @@
-# Sora → Save Video Bridge (ComfyUI custom node)
-# End-to-end: poll OpenAI Videos API, download MP4, decode to VIDEO tensor for native "Save Video".
+# 🎬 Sora → Video (for Save Video)
+# End-to-end: poll OpenAI Videos API, download MP4, decode to VIDEO object
+# compatible with the native ComfyUI "Save Video" node.
 # Category: Morfeo/Sora
 
-import os, time, json, io
-
+import os, time, json
 from typing import Any, List
 
 try:
@@ -16,9 +16,6 @@ try:
 except Exception:
     cv2 = None
 
-import numpy as np
-import torch
-
 try:
     from folder_paths import get_output_directory
 except Exception:
@@ -26,17 +23,21 @@ except Exception:
         return os.path.join(os.getcwd(), "output")
 
 
+# ---- Helpers ---------------------------------------------------------------
+
 def _json_to_dict(obj: Any):
+    """Accepts bytes/str/dict and returns a dict."""
     if isinstance(obj, (bytes, bytearray, memoryview)):
         s = bytes(obj).decode("utf-8", errors="ignore")
         return json.loads(s)
     if isinstance(obj, str):
         s = obj.strip()
-        if s.startswith("b'") or s.startswith('b"'):
+        # Allow strings like b'{"id": ...}'
+        if (s.startswith("b'") and s.endswith("'")) or (s.startswith('b"') and s.endswith('"')):
             try:
-                s = eval(s)
-                if isinstance(s, (bytes, bytearray)):
-                    s = s.decode("utf-8", errors="ignore")
+                s_eval = eval(s)
+                if isinstance(s_eval, (bytes, bytearray)):
+                    s = s_eval.decode("utf-8", errors="ignore")
             except Exception:
                 pass
         return json.loads(s)
@@ -68,16 +69,15 @@ def _http_get_bytes(url, headers):
     return r.content
 
 
-def _mp4_bytes_to_video_tensor(mp4_bytes: bytes, fps_override: int | None = None):
+def _mp4_bytes_to_frames_list(mp4_bytes: bytes, fps_override: int | None = None):
     """
-    Decode MP4 bytes into ComfyUI VIDEO type:
-    returns dict: {"frames": torch.FloatTensor [N,H,W,3] in 0..1, "fps": int}
+    Decode MP4 bytes into a list of RGB uint8 frames + fps.
     """
     if cv2 is None:
-        raise RuntimeError("OpenCV (cv2) not available in this environment. Install opencv-python-headless.")
+        raise RuntimeError("OpenCV (cv2) not available. Install opencv-python-headless.")
 
-    # Save to temp to let OpenCV read it
     out_dir = get_output_directory()
+    os.makedirs(out_dir, exist_ok=True)
     tmp_path = os.path.join(out_dir, "_tmp_sora_decode.mp4")
     with open(tmp_path, "wb") as f:
         f.write(mp4_bytes)
@@ -86,20 +86,17 @@ def _mp4_bytes_to_video_tensor(mp4_bytes: bytes, fps_override: int | None = None
     if not cap.isOpened():
         raise RuntimeError("Failed to open temp MP4 for decoding.")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps <= 0:
-        fps = 24.0
-    if fps_override:
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    if fps_override and fps_override > 0:
         fps = fps_override
 
-    frames: List[np.ndarray] = []
+    frames: List = []
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
             break
-        # BGR -> RGB
-        frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        frames.append(frame)
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)  # uint8 RGB
+        frames.append(frame_rgb)
 
     cap.release()
     try:
@@ -110,11 +107,39 @@ def _mp4_bytes_to_video_tensor(mp4_bytes: bytes, fps_override: int | None = None
     if not frames:
         raise RuntimeError("No frames decoded from MP4.")
 
-    arr = np.stack(frames, axis=0).astype(np.float32) / 255.0  # [N,H,W,3]
-    tensor = torch.from_numpy(arr)  # FloatTensor [N,H,W,3]
+    return frames, int(round(fps))
 
-    return {"frames": tensor, "fps": int(round(fps))}
 
+# ---- VIDEO adapter for native SaveVideo -----------------------------------
+
+class _SimpleVideo:
+    """
+    Minimal adapter that implements the interface expected by ComfyUI SaveVideo:
+      - get_dimensions() -> (w, h)
+      - get_fps() -> int
+      - get_frame_count() -> int
+      - frame_generator() -> yields uint8 RGB frames
+    """
+    def __init__(self, frames_rgb_uint8: List, fps: int):
+        self._frames = frames_rgb_uint8
+        self._fps = int(fps)
+
+    def get_dimensions(self):
+        h, w, _ = self._frames[0].shape
+        return (w, h)
+
+    def get_fps(self):
+        return self._fps
+
+    def get_frame_count(self):
+        return len(self._frames)
+
+    def frame_generator(self):
+        for f in self._frames:
+            yield f
+
+
+# ---- Node ------------------------------------------------------------------
 
 class SoraPollDownloadToVideo:
     @classmethod
@@ -122,51 +147,54 @@ class SoraPollDownloadToVideo:
         return {
             "required": {
                 "auth_header": ("STRING", {"default": "Bearer sk-..."}),
-                "video_id": ("STRING", {"default": ""}),          # opcional si pasás create_response
-                "create_response": ("ANY", {"default": ""}),      # ANY: bytes/str/dict del POST
-                "poll_interval_sec": ("INT", {"default": 5, "min":1, "max":60}),
-                "max_attempts": ("INT", {"default": 60, "min":1, "max":2000}),
-                "variant": ("STRING", {"default": ""}),           # ?variant=
-                "fps_override": ("INT", {"default": 0, "min":0, "max":120}), # 0 = usa FPS del archivo
+                "video_id": ("STRING", {"default": ""}),            # optional if create_response is given
+                "create_response": ("ANY", {"default": ""}),        # ANY: bytes/str/dict with {"id": ...}
+                "poll_interval_sec": ("INT", {"default": 5, "min": 1, "max": 60}),
+                "max_attempts": ("INT", {"default": 60, "min": 1, "max": 2000}),
+                "variant": ("STRING", {"default": ""}),             # optional ?variant=
+                "fps_override": ("INT", {"default": 0, "min": 0, "max": 120}),  # 0 = use file FPS
             }
         }
 
-    RETURN_TYPES = ("VIDEO","STRING","STRING")
-    RETURN_NAMES = ("video","status_json","file_path")
+    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
+    RETURN_NAMES = ("video", "status_json", "file_path")
     FUNCTION = "run"
     CATEGORY = "Morfeo/Sora"
 
     def run(self, auth_header, video_id, create_response, poll_interval_sec, max_attempts, variant, fps_override):
-        # Derivar ID
+        # Derive video id
         vid = (video_id or "").strip()
         if not vid and create_response:
             try:
                 payload = _json_to_dict(create_response)
-                vid = payload.get("id","").strip()
+                vid = (payload.get("id") or "").strip()
             except Exception:
                 pass
         if not vid:
-            raise ValueError("SoraPollDownloadToVideo: Provide 'video_id' or 'create_response' with an 'id'.")
+            raise ValueError("SoraPollDownloadToVideo: Provide 'video_id' or pass 'create_response' from POST /v1/videos (must contain 'id').")
 
         base = "https://api.openai.com/v1/videos"
         status_url = f"{base}/{vid}"
         headers = {"Authorization": auth_header}
 
-        # Polling
+        # Polling until completed/failed
         attempts = 0
         last_json = None
         while attempts < max_attempts:
             attempts += 1
             last_json = _http_get_json(status_url, headers)
-            if last_json.get("status") == "completed":
+            status = last_json.get("status")
+            if status == "completed":
                 break
-            if last_json.get("status") == "failed" or last_json.get("error"):
-                # Propagar el estado para debug
-                return ({"frames": torch.zeros((1,1,1,3), dtype=torch.float32), "fps": 1}, json.dumps(last_json), "")
+            if status == "failed" or last_json.get("error"):
+                # Emit empty 1x1 video object + status for debugging
+                empty = _SimpleVideo([__import__("numpy").zeros((1,1,3), dtype="uint8")], fps=1)
+                return (empty, json.dumps(last_json), "")
             time.sleep(poll_interval_sec)
 
         if not last_json or last_json.get("status") != "completed":
-            return ({"frames": torch.zeros((1,1,1,3), dtype=torch.float32), "fps": 1}, json.dumps(last_json or {}), "")
+            empty = _SimpleVideo([__import__("numpy").zeros((1,1,3), dtype="uint8")], fps=1)
+            return (empty, json.dumps(last_json or {}), "")
 
         # Download content
         content_url = f"{status_url}/content"
@@ -174,17 +202,18 @@ class SoraPollDownloadToVideo:
             content_url += f"?variant={variant}"
         mp4_bytes = _http_get_bytes(content_url, headers)
 
-        # Save a copy to /output for referencia
+        # Save reference MP4 to /output
         out_dir = get_output_directory()
         os.makedirs(out_dir, exist_ok=True)
         file_path = os.path.join(out_dir, f"{vid}.mp4")
         with open(file_path, "wb") as f:
             f.write(mp4_bytes)
 
-        # Decode to VIDEO tensor
-        video_tensor = _mp4_bytes_to_video_tensor(mp4_bytes, fps_override if fps_override>0 else None)
+        # Decode to frames + fps and wrap into VIDEO object
+        frames, fps = _mp4_bytes_to_frames_list(mp4_bytes, fps_override if fps_override > 0 else None)
+        video_obj = _SimpleVideo(frames, fps)
 
-        return (video_tensor, json.dumps(last_json), file_path)
+        return (video_obj, json.dumps(last_json), file_path)
 
 
 NODE_CLASS_MAPPINGS = {"SoraPollDownloadToVideo": SoraPollDownloadToVideo}
