@@ -1,8 +1,4 @@
-# 🎬 Sora → Video (for Save Video)
-# End-to-end: poll OpenAI Videos API, download MP4, decode to VIDEO object
-# compatible with native "Save Video" node.
-# Category: Morfeo/Sora
-
+# 🎬 Sora → Video (for Save Video)  — FINAL
 import os, time, json
 from typing import Any, List
 import numpy as np
@@ -23,9 +19,6 @@ except Exception:
     def get_output_directory():
         return os.path.join(os.getcwd(), "output")
 
-
-# ---- Helpers ---------------------------------------------------------------
-
 def _json_to_dict(obj: Any):
     if isinstance(obj, (bytes, bytearray, memoryview)):
         s = bytes(obj).decode("utf-8", errors="ignore")
@@ -44,7 +37,6 @@ def _json_to_dict(obj: Any):
         return obj
     return json.loads(str(obj))
 
-
 def _http_get_json(url, headers):
     if requests is None:
         import urllib.request
@@ -56,7 +48,6 @@ def _http_get_json(url, headers):
     r.raise_for_status()
     return r.json()
 
-
 def _http_get_bytes(url, headers):
     if requests is None:
         import urllib.request
@@ -67,47 +58,34 @@ def _http_get_bytes(url, headers):
     r.raise_for_status()
     return r.content
 
-
 def _mp4_bytes_to_frames_list(mp4_bytes: bytes, fps_override: int | None = None):
-    """Decode MP4 bytes into a list of RGB uint8 frames + fps."""
     if cv2 is None:
-        raise RuntimeError("OpenCV (cv2) not available. Install opencv-python-headless.")
-
+        raise RuntimeError("OpenCV (cv2) no disponible. Instalar opencv-python-headless.")
     out_dir = get_output_directory()
     os.makedirs(out_dir, exist_ok=True)
     tmp_path = os.path.join(out_dir, "_tmp_sora_decode.mp4")
     with open(tmp_path, "wb") as f:
         f.write(mp4_bytes)
-
     cap = cv2.VideoCapture(tmp_path)
     if not cap.isOpened():
-        raise RuntimeError("Failed to open temp MP4 for decoding.")
-
+        raise RuntimeError("No se pudo abrir MP4 temporal.")
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     if fps_override and fps_override > 0:
         fps = fps_override
-
     frames = []
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
             break
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        frames.append(frame_rgb)
-
+        frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
     cap.release()
     try: os.remove(tmp_path)
     except: pass
-
     if not frames:
-        raise RuntimeError("No frames decoded from MP4.")
+        raise RuntimeError("Sin frames decodificados del MP4.")
     return frames, int(round(fps))
 
-
-# ---- VIDEO adapter for SaveVideo ------------------------------------------
-
 class _SimpleVideo:
-    """Implements the API that ComfyUI SaveVideo expects."""
     def __init__(self, frames_rgb_uint8: List[np.ndarray], fps: int):
         self._frames = frames_rgb_uint8
         self._fps = int(fps)
@@ -126,22 +104,35 @@ class _SimpleVideo:
         for f in self._frames:
             yield f
 
-    # <-- Fix: SaveVideo calls save_to() internally -->
-    def save_to(self, path: str, codec: str = "mp4v"):
+    # Acepta kwargs que pasa SaveVideo: format, codec, fps, etc.
+    def save_to(self, path: str, *, format: str | None = None, codec: str | None = None,
+                fps: float | None = None, **kwargs):
         if cv2 is None:
-            raise RuntimeError("OpenCV required for save_to().")
-
+            raise RuntimeError("OpenCV requerido para save_to().")
         w, h = self.get_dimensions()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*codec)
-        out = cv2.VideoWriter(path, fourcc, self._fps, (w, h))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+        # Mapeo básico de codec -> fourcc para OpenCV
+        # (SaveVideo puede pasar 'auto', 'h264', 'hevc', 'mp4v', etc.)
+        codec = (codec or "mp4v").lower()
+        mapping = {
+            "auto": "mp4v",
+            "mp4v": "mp4v",
+            "h264": "avc1",   # depende de build ffmpeg/opencv
+            "hevc": "hevc",   # idem
+            "mpeg4": "mp4v",
+            "vp9": "vp90",
+            "av1": "av01",
+        }
+        fourcc_str = mapping.get(codec, "mp4v")
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+
+        out_fps = float(fps) if fps and fps > 0 else float(self._fps)
+        vw = cv2.VideoWriter(path, fourcc, out_fps, (w, h))
         for f in self._frames:
-            out.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
-        out.release()
-        print(f"[SimpleVideo] Saved to {path}")
-
-
-# ---- Node -----------------------------------------------------------------
+            vw.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+        vw.release()
+        print(f"[SimpleVideo] Saved to {path} (format={format}, codec={codec}, fps={out_fps})")
 
 class SoraPollDownloadToVideo:
     @classmethod
@@ -172,7 +163,7 @@ class SoraPollDownloadToVideo:
             except Exception:
                 pass
         if not vid:
-            raise ValueError("Provide 'video_id' or 'create_response' with an 'id' field.")
+            raise ValueError("Falta 'video_id' o 'create_response' con 'id'.")
 
         base = "https://api.openai.com/v1/videos"
         status_url = f"{base}/{vid}"
@@ -183,18 +174,18 @@ class SoraPollDownloadToVideo:
         while attempts < max_attempts:
             attempts += 1
             last_json = _http_get_json(status_url, headers)
-            if last_json.get("status") == "completed":
+            s = last_json.get("status")
+            if s == "completed":
                 break
-            if last_json.get("status") == "failed" or last_json.get("error"):
-                empty = _SimpleVideo([np.zeros((1, 1, 3), dtype=np.uint8)], 1)
+            if s == "failed" or last_json.get("error"):
+                empty = _SimpleVideo([np.zeros((1,1,3), dtype=np.uint8)], 1)
                 return (empty, json.dumps(last_json), "")
             time.sleep(poll_interval_sec)
 
         if not last_json or last_json.get("status") != "completed":
-            empty = _SimpleVideo([np.zeros((1, 1, 3), dtype=np.uint8)], 1)
+            empty = _SimpleVideo([np.zeros((1,1,3), dtype=np.uint8)], 1)
             return (empty, json.dumps(last_json or {}), "")
 
-        # Download content
         content_url = f"{status_url}/content"
         if variant:
             content_url += f"?variant={variant}"
@@ -208,9 +199,7 @@ class SoraPollDownloadToVideo:
 
         frames, fps = _mp4_bytes_to_frames_list(mp4_bytes, fps_override if fps_override > 0 else None)
         video_obj = _SimpleVideo(frames, fps)
-
         return (video_obj, json.dumps(last_json), file_path)
-
 
 NODE_CLASS_MAPPINGS = {"SoraPollDownloadToVideo": SoraPollDownloadToVideo}
 NODE_DISPLAY_NAME_MAPPINGS = {"SoraPollDownloadToVideo": "🎬 Sora → Video (for Save Video)"}
