@@ -1,10 +1,11 @@
 # 🎬 Sora → Video (for Save Video)
 # End-to-end: poll OpenAI Videos API, download MP4, decode to VIDEO object
-# compatible with the native ComfyUI "Save Video" node.
+# compatible with native "Save Video" node.
 # Category: Morfeo/Sora
 
 import os, time, json
 from typing import Any, List
+import numpy as np
 
 try:
     import requests
@@ -26,13 +27,11 @@ except Exception:
 # ---- Helpers ---------------------------------------------------------------
 
 def _json_to_dict(obj: Any):
-    """Accepts bytes/str/dict and returns a dict."""
     if isinstance(obj, (bytes, bytearray, memoryview)):
         s = bytes(obj).decode("utf-8", errors="ignore")
         return json.loads(s)
     if isinstance(obj, str):
         s = obj.strip()
-        # Allow strings like b'{"id": ...}'
         if (s.startswith("b'") and s.endswith("'")) or (s.startswith('b"') and s.endswith('"')):
             try:
                 s_eval = eval(s)
@@ -70,9 +69,7 @@ def _http_get_bytes(url, headers):
 
 
 def _mp4_bytes_to_frames_list(mp4_bytes: bytes, fps_override: int | None = None):
-    """
-    Decode MP4 bytes into a list of RGB uint8 frames + fps.
-    """
+    """Decode MP4 bytes into a list of RGB uint8 frames + fps."""
     if cv2 is None:
         raise RuntimeError("OpenCV (cv2) not available. Install opencv-python-headless.")
 
@@ -90,37 +87,28 @@ def _mp4_bytes_to_frames_list(mp4_bytes: bytes, fps_override: int | None = None)
     if fps_override and fps_override > 0:
         fps = fps_override
 
-    frames: List = []
+    frames = []
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
             break
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)  # uint8 RGB
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         frames.append(frame_rgb)
 
     cap.release()
-    try:
-        os.remove(tmp_path)
-    except Exception:
-        pass
+    try: os.remove(tmp_path)
+    except: pass
 
     if not frames:
         raise RuntimeError("No frames decoded from MP4.")
-
     return frames, int(round(fps))
 
 
-# ---- VIDEO adapter for native SaveVideo -----------------------------------
+# ---- VIDEO adapter for SaveVideo ------------------------------------------
 
 class _SimpleVideo:
-    """
-    Minimal adapter that implements the interface expected by ComfyUI SaveVideo:
-      - get_dimensions() -> (w, h)
-      - get_fps() -> int
-      - get_frame_count() -> int
-      - frame_generator() -> yields uint8 RGB frames
-    """
-    def __init__(self, frames_rgb_uint8: List, fps: int):
+    """Implements the API that ComfyUI SaveVideo expects."""
+    def __init__(self, frames_rgb_uint8: List[np.ndarray], fps: int):
         self._frames = frames_rgb_uint8
         self._fps = int(fps)
 
@@ -138,8 +126,22 @@ class _SimpleVideo:
         for f in self._frames:
             yield f
 
+    # <-- Fix: SaveVideo calls save_to() internally -->
+    def save_to(self, path: str, codec: str = "mp4v"):
+        if cv2 is None:
+            raise RuntimeError("OpenCV required for save_to().")
 
-# ---- Node ------------------------------------------------------------------
+        w, h = self.get_dimensions()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        out = cv2.VideoWriter(path, fourcc, self._fps, (w, h))
+        for f in self._frames:
+            out.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+        out.release()
+        print(f"[SimpleVideo] Saved to {path}")
+
+
+# ---- Node -----------------------------------------------------------------
 
 class SoraPollDownloadToVideo:
     @classmethod
@@ -147,12 +149,12 @@ class SoraPollDownloadToVideo:
         return {
             "required": {
                 "auth_header": ("STRING", {"default": "Bearer sk-..."}),
-                "video_id": ("STRING", {"default": ""}),            # optional if create_response is given
-                "create_response": ("ANY", {"default": ""}),        # ANY: bytes/str/dict with {"id": ...}
+                "video_id": ("STRING", {"default": ""}),
+                "create_response": ("ANY", {"default": ""}),
                 "poll_interval_sec": ("INT", {"default": 5, "min": 1, "max": 60}),
                 "max_attempts": ("INT", {"default": 60, "min": 1, "max": 2000}),
-                "variant": ("STRING", {"default": ""}),             # optional ?variant=
-                "fps_override": ("INT", {"default": 0, "min": 0, "max": 120}),  # 0 = use file FPS
+                "variant": ("STRING", {"default": ""}),
+                "fps_override": ("INT", {"default": 0, "min": 0, "max": 120}),
             }
         }
 
@@ -162,7 +164,6 @@ class SoraPollDownloadToVideo:
     CATEGORY = "Morfeo/Sora"
 
     def run(self, auth_header, video_id, create_response, poll_interval_sec, max_attempts, variant, fps_override):
-        # Derive video id
         vid = (video_id or "").strip()
         if not vid and create_response:
             try:
@@ -171,29 +172,26 @@ class SoraPollDownloadToVideo:
             except Exception:
                 pass
         if not vid:
-            raise ValueError("SoraPollDownloadToVideo: Provide 'video_id' or pass 'create_response' from POST /v1/videos (must contain 'id').")
+            raise ValueError("Provide 'video_id' or 'create_response' with an 'id' field.")
 
         base = "https://api.openai.com/v1/videos"
         status_url = f"{base}/{vid}"
         headers = {"Authorization": auth_header}
 
-        # Polling until completed/failed
         attempts = 0
         last_json = None
         while attempts < max_attempts:
             attempts += 1
             last_json = _http_get_json(status_url, headers)
-            status = last_json.get("status")
-            if status == "completed":
+            if last_json.get("status") == "completed":
                 break
-            if status == "failed" or last_json.get("error"):
-                # Emit empty 1x1 video object + status for debugging
-                empty = _SimpleVideo([__import__("numpy").zeros((1,1,3), dtype="uint8")], fps=1)
+            if last_json.get("status") == "failed" or last_json.get("error"):
+                empty = _SimpleVideo([np.zeros((1, 1, 3), dtype=np.uint8)], 1)
                 return (empty, json.dumps(last_json), "")
             time.sleep(poll_interval_sec)
 
         if not last_json or last_json.get("status") != "completed":
-            empty = _SimpleVideo([__import__("numpy").zeros((1,1,3), dtype="uint8")], fps=1)
+            empty = _SimpleVideo([np.zeros((1, 1, 3), dtype=np.uint8)], 1)
             return (empty, json.dumps(last_json or {}), "")
 
         # Download content
@@ -202,14 +200,12 @@ class SoraPollDownloadToVideo:
             content_url += f"?variant={variant}"
         mp4_bytes = _http_get_bytes(content_url, headers)
 
-        # Save reference MP4 to /output
         out_dir = get_output_directory()
         os.makedirs(out_dir, exist_ok=True)
         file_path = os.path.join(out_dir, f"{vid}.mp4")
         with open(file_path, "wb") as f:
             f.write(mp4_bytes)
 
-        # Decode to frames + fps and wrap into VIDEO object
         frames, fps = _mp4_bytes_to_frames_list(mp4_bytes, fps_override if fps_override > 0 else None)
         video_obj = _SimpleVideo(frames, fps)
 
