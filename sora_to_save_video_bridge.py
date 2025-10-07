@@ -1,5 +1,5 @@
-# 🎬 Sora → Video (for Save Video) — FINAL con AUDIO + faststart
-import os, time, json, subprocess
+# 🎬 Sora → Video (for Save Video) — AUDIO + faststart + ID tolerant
+import os, time, json, subprocess, re
 from typing import Any, List
 import numpy as np
 
@@ -19,13 +19,17 @@ except Exception:
     def get_output_directory():
         return os.path.join(os.getcwd(), "output")
 
-
-# ------------------------- Helpers -------------------------
-
 def _json_to_dict(obj: Any):
     if isinstance(obj, (bytes, bytearray, memoryview)):
         s = bytes(obj).decode("utf-8", errors="ignore")
-        return json.loads(s)
+        # doble parse por si viene escapado
+        try:
+            d = json.loads(s)
+            if isinstance(d, str):
+                return json.loads(d)
+            return d
+        except Exception:
+            return json.loads(s)
     if isinstance(obj, str):
         s = obj.strip()
         if (s.startswith("b'") and s.endswith("'")) or (s.startswith('b"') and s.endswith('"')):
@@ -35,10 +39,33 @@ def _json_to_dict(obj: Any):
                     s = s_eval.decode("utf-8", errors="ignore")
             except Exception:
                 pass
-        return json.loads(s)
+        # doble parse si viene con comillas escapadas
+        d = json.loads(s)
+        if isinstance(d, str):
+            return json.loads(d)
+        return d
     if isinstance(obj, dict):
         return obj
     return json.loads(str(obj))
+
+def _extract_video_id(source: Any) -> str:
+    """Devuelve un video_id aunque venga JSON, bytes, texto con logs, etc."""
+    # 1) intentar como dict JSON
+    try:
+        d = _json_to_dict(source)
+        vid = (d.get("id") or d.get("video_id") or "").strip()
+        if vid:
+            return vid
+    except Exception:
+        pass
+    # 2) raw string/bytes con regex
+    s = ""
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        s = bytes(source).decode("utf-8", errors="ignore")
+    else:
+        s = str(source)
+    m = re.search(r"(video_[0-9a-fA-F]+)", s)
+    return m.group(1) if m else ""
 
 def _http_get_json(url, headers):
     if requests is None:
@@ -92,19 +119,11 @@ def _run_ffmpeg(cmd: list[str]) -> tuple[int, str, str]:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return p.returncode, p.stdout.decode("utf-8", errors="ignore"), p.stderr.decode("utf-8", errors="ignore")
 
-
-# ---------------------- VIDEO adapter ----------------------
-
 class _SimpleVideo:
-    """
-    Objeto VIDEO compatible con SaveVideo.
-    Al guardar (save_to) genera un MP4 mudo temporal y MUXEA el AUDIO original,
-    dejando el archivo final con -movflags +faststart (previsualizable en web).
-    """
     def __init__(self, frames_rgb_uint8: List[np.ndarray], fps: int, audio_path: str | None = None):
         self._frames = frames_rgb_uint8
         self._fps = int(fps)
-        self._audio_path = audio_path  # MP4 original (con audio)
+        self._audio_path = audio_path
 
     def get_dimensions(self):
         h, w, _ = self._frames[0].shape
@@ -137,16 +156,13 @@ class _SimpleVideo:
 
     def save_to(self, path: str, *, format: str | None = None, codec: str | None = None,
                 fps: float | None = None, **kwargs):
-        # 1) video mudo temporal (frames→mp4)
         temp_silent = os.path.splitext(path)[0] + ".__silent__.mp4"
         out_fps = self._write_silent_video(temp_silent, codec, fps)
 
-        # 2) mux con audio original y +faststart para streaming
         audio_src = self._audio_path
         ffmpeg_bin = os.environ.get("FFMPEG_BIN", "ffmpeg")
 
         if audio_src and os.path.exists(audio_src):
-            # a) intento copy + faststart
             cmd_copy = [
                 ffmpeg_bin, "-y",
                 "-i", temp_silent,
@@ -161,7 +177,6 @@ class _SimpleVideo:
             ]
             code, _, _ = _run_ffmpeg(cmd_copy)
             if code != 0 or (not os.path.exists(path)) or os.path.getsize(path) == 0:
-                # b) reencode h264+yuv420p + aac + faststart (máxima compatibilidad)
                 cmd_enc = [
                     ffmpeg_bin, "-y",
                     "-i", temp_silent,
@@ -180,9 +195,8 @@ class _SimpleVideo:
                     "-movflags", "+faststart",
                     path
                 ]
-                code2, _, err2 = _run_ffmpeg(cmd_enc)
+                code2, _, _ = _run_ffmpeg(cmd_enc)
                 if code2 != 0 or (not os.path.exists(path)) or os.path.getsize(path) == 0:
-                    # Fallback: sin audio
                     os.replace(temp_silent, path)
                 else:
                     try: os.remove(temp_silent)
@@ -191,13 +205,9 @@ class _SimpleVideo:
                 try: os.remove(temp_silent)
                 except: pass
         else:
-            # sin audio: dejar mudo
             os.replace(temp_silent, path)
 
         print(f"[SimpleVideo] Saved to {path} (codec={codec}, fps={out_fps}, audio={'yes' if audio_src else 'no'})")
-
-
-# ------------------------- Node -------------------------
 
 class SoraPollDownloadToVideo:
     @classmethod
@@ -221,14 +231,11 @@ class SoraPollDownloadToVideo:
 
     def run(self, auth_header, video_id, create_response, poll_interval_sec, max_attempts, variant, fps_override):
         vid = (video_id or "").strip()
-        if not vid and create_response:
-            try:
-                payload = _json_to_dict(create_response)
-                vid = (payload.get("id") or "").strip()
-            except Exception:
-                pass
+        if not vid and create_response not in ("", None):
+            vid = _extract_video_id(create_response)
+
         if not vid:
-            raise ValueError("Falta 'video_id' o 'create_response' con 'id'.")
+            raise ValueError("Falta 'video_id' o 'create_response' con 'id'. Conectá POST.any → create_response, o pasá el ID en video_id.")
 
         base = "https://api.openai.com/v1/videos"
         status_url = f"{base}/{vid}"
@@ -251,7 +258,6 @@ class SoraPollDownloadToVideo:
             empty = _SimpleVideo([np.zeros((1,1,3), dtype=np.uint8)], 1, audio_path=None)
             return (empty, json.dumps(last_json or {}), "")
 
-        # Descargar MP4 original (suele traer audio)
         content_url = f"{status_url}/content"
         if variant:
             content_url += f"?variant={variant}"
@@ -263,11 +269,9 @@ class SoraPollDownloadToVideo:
         with open(file_path, "wb") as f:
             f.write(mp4_bytes)
 
-        # Frames para SaveVideo y path con audio para mux
         frames, fps = _mp4_bytes_to_frames_list(mp4_bytes, fps_override if fps_override > 0 else None)
         video_obj = _SimpleVideo(frames, fps, audio_path=file_path)
         return (video_obj, json.dumps(last_json), file_path)
-
 
 NODE_CLASS_MAPPINGS = {"SoraPollDownloadToVideo": SoraPollDownloadToVideo}
 NODE_DISPLAY_NAME_MAPPINGS = {"SoraPollDownloadToVideo": "🎬 Sora → Video (for Save Video)"}
